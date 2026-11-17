@@ -1,0 +1,170 @@
+{
+  "name": "JSM Weekly Status Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 8
+            }
+          ]
+        }
+      },
+      "name": "Monday 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.JIRA_BASE_URL }}/rest/api/3/search/jql",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "jql",
+              "value": "project = \"YOUR_PROJECT_KEY\" AND (created >= -7d OR resolutiondate >= -7d OR resolution = Unresolved)"
+            },
+            {
+              "name": "fields",
+              "value": "issuetype,priority,created,resolutiondate"
+            },
+            {
+              "name": "maxResults",
+              "value": "100"
+            }
+          ]
+        }
+      },
+      "name": "Jira: search issues",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node (\"Run Once for All Items\"). Reduces raw Jira issues to anonymous aggregate counts.\n// Only these aggregates leave the workflow toward the LLM: no ticket text, no names.\nconst issues = $input.all().flatMap(i => i.json.issues || []);\nconst now = Date.now();\nconst DAY = 86400000;\nconst stats = { window_days: 7, created: 0, resolved: 0, open_total: 0, by_type: {}, by_priority_open: {}, oldest_open_days: 0, median_resolution_hours: null };\nconst resHours = [];\nfor (const it of issues) {\n  const f = it.fields || {};\n  const type = (f.issuetype && f.issuetype.name) || 'Unknown';\n  const prio = (f.priority && f.priority.name) || 'None';\n  const created = new Date(f.created).getTime();\n  const resolved = f.resolutiondate ? new Date(f.resolutiondate).getTime() : null;\n  stats.by_type[type] = stats.by_type[type] || { created: 0, resolved: 0 };\n  if (now - created <= 7 * DAY) { stats.created++; stats.by_type[type].created++; }\n  if (resolved && now - resolved <= 7 * DAY) { stats.resolved++; stats.by_type[type].resolved++; resHours.push((resolved - created) / 3600000); }\n  if (!resolved) {\n    stats.open_total++;\n    stats.by_priority_open[prio] = (stats.by_priority_open[prio] || 0) + 1;\n    stats.oldest_open_days = Math.max(stats.oldest_open_days, Math.floor((now - created) / DAY));\n  }\n}\nif (resHours.length) {\n  resHours.sort((a, b) => a - b);\n  const m = Math.floor(resHours.length / 2);\n  stats.median_resolution_hours = Math.round((resHours.length % 2 ? resHours[m] : (resHours[m - 1] + resHours[m]) / 2) * 10) / 10;\n}\nstats.net_flow = stats.created - stats.resolved;\nreturn [{ json: { stats } }];\n// Created by Avash Mohanty, 2026\n"
+      },
+      "name": "Aggregate (no PII)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'claude-sonnet-5-5', max_tokens: 400, messages: [{ role: 'user', content: \"You are a delivery-management analyst. Write a weekly status note of max 120 words for a program steering group from the JSON counts below. Structure: 1 headline sentence, 3 bullets (flow, backlog risk, aging), 1 recommended action. Use only the numbers provided; do not invent causes. If net_flow is positive, say the backlog is growing.\" + '\\n\\n' + JSON.stringify($json.stats) }] }) }}"
+      },
+      "name": "LLM: draft status note",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "reports@example.com",
+        "toEmail": "you@example.com",
+        "subject": "={{ 'Weekly delivery status \u2013 ' + $now.toFormat('dd LLL yyyy') }}",
+        "emailFormat": "text",
+        "text": "={{ $json.content[0].text }}\n\n---\nData: {{ JSON.stringify($('Aggregate (no PII)').item.json.stats) }}\nDraft for human review before forwarding."
+      },
+      "name": "Email: send draft for review",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        880,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Monday 08:00": {
+      "main": [
+        [
+          {
+            "node": "Jira: search issues",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Jira: search issues": {
+      "main": [
+        [
+          {
+            "node": "Aggregate (no PII)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate (no PII)": {
+      "main": [
+        [
+          {
+            "node": "LLM: draft status note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM: draft status note": {
+      "main": [
+        [
+          {
+            "node": "Email: send draft for review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "createdBy": "Avash Mohanty, 2026"
+  }
+}
